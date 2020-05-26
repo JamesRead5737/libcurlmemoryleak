@@ -39,6 +39,7 @@ typedef struct _GlobalInfo
 	int concurrent_connections;
 	pthread_mutex_t parsed_lock;
 	int parsed_sites;
+	int transfers;
 } GlobalInfo;
 
 /* Information associated with a specific easy handle */
@@ -89,12 +90,35 @@ mcode_or_die(const char *where, CURLMcode code)
 }
 
 void
+print_progress(GlobalInfo *g)
+{
+	printf("\rParsed sites: %d, %d parallel connections, %d still running, %d transfers\t", 
+			g->parsed_sites, g->concurrent_connections, g->still_running, g->transfers);
+	fflush(stdout);
+}
+
+void
+transfers_inc(GlobalInfo *g)
+{
+	g->transfers++;
+
+	print_progress(g);
+}
+
+void
+transfers_dec(GlobalInfo *g)
+{
+	g->transfers--;
+
+	print_progress(g);
+}
+
+void
 concurrent_connections_inc(GlobalInfo *g)
 {
 	g->concurrent_connections++;
 
-	printf("\rParsed sites: %d, %d parallel connections, %d still running\t", g->parsed_sites, g->concurrent_connections, g->still_running);
-	fflush(stdout);
+	print_progress(g);
 }
 
 void
@@ -102,8 +126,7 @@ concurrent_connections_dec(GlobalInfo *g)
 {
 	g->concurrent_connections--;
 
-	printf("\rParsed sites: %d, %d parallel connections, %d still running\t", g->parsed_sites, g->concurrent_connections, g->still_running);
-	fflush(stdout);
+	print_progress(g);
 }
 
 static void timer_cb(GlobalInfo* g, int revents);
@@ -170,6 +193,7 @@ check_multi_info(GlobalInfo *g)
 			//free(conn->url);
 			free(conn->data);
 			curl_easy_cleanup(easy);
+			transfers_dec(g);
 			free(conn);
 		}
 	}
@@ -304,8 +328,7 @@ new_conn(char *url, GlobalInfo *g)
 		fprintf(MSG_OUT, "curl_easy_init() failed, exiting!\n");
 		exit(2);
 	}
-
-	int autoresolve = 0;
+	transfers_inc(g);
 
 	conn->global = g;
 	conn->url = url;
@@ -470,7 +493,7 @@ crawler_init()
 	fflush(MSG_OUT);
  
 	curl_multi_setopt(g.multi, CURLMOPT_SOCKETFUNCTION, end_sock_cb);
-	while (g.concurrent_connections > 0)
+	while (g.concurrent_connections > 0 || g.transfers > 0)
 	{
 		int idx;
                 int err = epoll_wait(g.epfd, events, sizeof(events)/sizeof(struct epoll_event), 10000);
