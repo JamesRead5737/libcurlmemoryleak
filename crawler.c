@@ -26,17 +26,7 @@
 #define mycase(code) \
         case code: s = __STRING(code)
 
-typedef struct _CrawlerConfig
-{
-	char redis_address[1024];
-	int redis_port;
-	char mongo_address[1024];
-	int mongo_port;
-
-	char url_file[1024];
-
-	int queue_length;
-} CrawlerConfig;
+#define MAX_CONNECTIONS 1024
 
 /* Global information, common to all connections */
 typedef struct _GlobalInfo
@@ -49,8 +39,6 @@ typedef struct _GlobalInfo
 	int concurrent_connections;
 	pthread_mutex_t parsed_lock;
 	int parsed_sites;
-
-	CrawlerConfig config;
 } GlobalInfo;
 
 /* Information associated with a specific easy handle */
@@ -306,11 +294,6 @@ new_conn(char *url, GlobalInfo *g)
 {
 	ConnInfo *conn;
 	CURLMcode rc;
-	char buffer1[1024];
-	char buffer2[1024];
-
-	memset(buffer1, 0, sizeof(buffer1));
-	memset(buffer2, 0, sizeof(buffer2));
 
 	conn = (ConnInfo*)calloc(1, sizeof(ConnInfo));
 	conn->error[0]='\0';
@@ -355,7 +338,7 @@ remsock(SockInfo *f, GlobalInfo* g)
 {
 	if (f) {
 		if (f->sockfd) {
-			g->concurrent_connections--;
+			concurrent_connections_dec(g);
 			if (epoll_ctl(g->epfd, EPOLL_CTL_DEL, f->sockfd, NULL))
 				fprintf(stderr, "EPOLL_CTL_DEL failed for fd: %d : %s\n",
 				  f->sockfd, strerror(errno));
@@ -375,16 +358,33 @@ sock_cb(CURL *e, curl_socket_t s, int what, void *cbp, void *sockp)
 	if (what == CURL_POLL_REMOVE) {
 		remsock(fdp, g);
 	} else {
-		if (!fdp) {
-			addsock(s, e, what, g);
-		} else {
-			setsock(fdp, s, e, what, g);
+		if (g->concurrent_connections < MAX_CONNECTIONS){
+			if (!fdp) {
+				addsock(s, e, what, g);
+			} else {
+				setsock(fdp, s, e, what, g);
+			}
 		}
 	}
 
 	return (0);
 }
- 
+
+/* CURLMOPT_SOCKETFUNCTION */
+static int
+end_sock_cb(CURL *e, curl_socket_t s, int what, void *cbp, void *sockp)
+{
+        GlobalInfo *g = (GlobalInfo*) cbp;
+        SockInfo *fdp = (SockInfo*) sockp;
+
+        if (what == CURL_POLL_REMOVE) {
+                remsock(fdp, g);
+        }
+
+        return (0);
+}
+
+
 int should_exit = 0;
  
 void
@@ -393,26 +393,16 @@ signal_handler(int signo)
 	should_exit = 1;
 }
 
-static void
-thread_sighandler(int signum)
-{
-	printf("\nCrawler exiting.\n");
-	pthread_exit(NULL);
-}
-
 void *
-crawler_init(void *arg)
+crawler_init()
 {
 	GlobalInfo g;
 	struct itimerspec its;
 	struct epoll_event ev;
 	struct epoll_event events[10000];
 
-	signal(SIGUSR1, thread_sighandler);
 
 	memset(&g, 0, sizeof(GlobalInfo));
-
-	memcpy(&g.config, arg, sizeof(CrawlerConfig));
 
 	g.epfd = epoll_create1(EPOLL_CLOEXEC);
 	if (g.epfd == -1) {
@@ -479,6 +469,35 @@ crawler_init(void *arg)
 	fprintf(MSG_OUT, "Exiting normally.\n");
 	fflush(MSG_OUT);
  
+	curl_multi_setopt(g.multi, CURLMOPT_SOCKETFUNCTION, end_sock_cb);
+	while (g.concurrent_connections > 0)
+	{
+		int idx;
+                int err = epoll_wait(g.epfd, events, sizeof(events)/sizeof(struct epoll_event), 10000);
+
+                if (err == -1) {
+                        if (errno == EINTR) {
+                                fprintf(MSG_OUT, "note: wait interrupted\n");
+                                continue;
+                        } else {
+                                perror("epoll_wait");
+                                exit(1);
+                        }
+                }
+
+                for (idx = 0; idx < err; ++idx) {
+                        if (events[idx].data.fd == g.tfd) {
+                                timer_cb(&g, events[idx].events);
+                        } else {
+                                event_cb(&g, events[idx].data.fd, events[idx].events);
+                        }
+                }
+
+	}
+
+	fprintf(MSG_OUT, "Finished all in progress downloads.\n");
+	fflush(MSG_OUT);
+
 	curl_multi_cleanup(g.multi);
 	curl_global_cleanup();
 
@@ -489,16 +508,12 @@ int
 main(int argc, char **argv)
 {
 	int cleanup = 0, opt, ret;
-	CrawlerConfig config;
-
-	memset(&config, 0, sizeof(config));
-	config.queue_length = DEFAULT_QUEUE_LENGTH;
 
 	should_exit = 0;
 	signal(SIGINT, signal_handler);
 	signal(SIGKILL, signal_handler);
 
-	crawler_init( (void *)&config);
+	crawler_init();
 
 
 	printf("Exiting.\n");
